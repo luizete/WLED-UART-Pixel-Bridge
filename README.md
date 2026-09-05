@@ -1,6 +1,6 @@
 # WLED UART Pixel Bridge
 
-A WLED usermod that sends raw RGB frames from one ESP32 running WLED to another ESP32 over a dedicated UART. For installation in a car, place a 3.3 V differential transceiver such as a MAX3485 at each end and carry the UART as an A/B twisted pair plus a reference ground.
+A WLED usermod that sends raw RGB frames from one ESP32 running WLED to another ESP32 over a dedicated UART. For installation in a car, place a 3.3 V differential transceiver such as a MAX3485 at each end and carry the UART as an A/B twisted pair plus a reference ground. However, just a single wire between RX and TX will likely work fine.
 
 Targeted and reviewed against current WLED `main` behavior, including the serial/Adalight realtime path and usermod configuration API.
 
