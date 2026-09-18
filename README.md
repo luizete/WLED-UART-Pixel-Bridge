@@ -2,7 +2,7 @@
 
 A WLED usermod that sends raw RGB frames from one ESP32 running WLED to another ESP32 over a dedicated UART. For installation in a car, place a 3.3 V differential transceiver such as a MAX3485 at each end and carry the UART as an A/B twisted pair plus a reference ground. However, just a single wire between RX and TX will likely work fine.
 
-Targeted and reviewed against current WLED `main` behavior, including the serial/Adalight realtime path and usermod configuration API.
+Targeted and reviewed against WLED 16.0.1, including the serial/Adalight realtime path and usermod configuration API.
 
 ## What it provides
 
@@ -36,9 +36,9 @@ Then add the usermod to your `platformio_override.ini`. For a classic ESP32 with
 
 ```ini
 [platformio]
-default_envs = esp32dev_V4
+default_envs = esp32dev
 
-[env:esp32dev_V4]
+[env:esp32dev]
 custom_usermods =
   audioreactive
   uart_pixel_bridge
@@ -71,7 +71,25 @@ target-start = 0
 led-count    = 300
 ```
 
-`led-count`, baud and framing must match on both devices. `source-start` is relevant only on the Master; `target-start` is relevant only on the Receiver.
+Baud and framing must match on both devices. `target-start` is relevant only on the Receiver.
+
+## Sending the whole strip (v1.5.0)
+
+With `send-all` enabled on the Master, it ignores its own `source-start`, `led-count` and `reverse` and sends every LED of the strip (`strip.getLengthTotal()`, at most 2048). The bridge restarts by itself when the WLED LED configuration changes the total. Every Receiver then cuts its own window out of the frame:
+
+```text
+Receiver:
+  source-start = first LED of the received frame used here
+  led-count    = LEDs taken from the frame (buffers are sized for this only)
+  target-start = first physical LED written
+  reverse      = reverse this window when applying
+```
+
+A frame that does not contain `source-start + led-count` LEDs counts as a framing error and is not shown. If a frame arrives with the reverse flag set (older Master, or `send-all` off with `reverse` on), the Receiver undoes it before cutting its window; the output is reversed when exactly one of the frame flag and the Receiver `reverse` is set.
+
+Frame size is `18 + 3·N` bytes at 10 line bits per byte, so keep `max-fps ≤ baud / (10 · (18 + 3·N))`; above that the Master drops frames (`dropped` rises). At 2 Mbaud: 600 LEDs → 110 fps, 1000 → 66 fps, 2048 → 32 fps.
+
+**Upgrade order:** update the Receivers first (with `source-start = 0` they behave as before against an old Master), then the Master, enabling `send-all` and disabling `reverse`, and set `source-start`/`reverse` on each Receiver. A v1.4.0 Receiver rejects every frame larger than its `led-count`.
 
 ## Suggested settings
 
@@ -112,6 +130,8 @@ reacquire-valid-frames: 2
 ```
 
 Do not configure the chosen UART pins as LED outputs, buttons, relays, I2C, or other WLED functions.
+
+**Gamma (WLED 16):** frames carry WLED's framebuffer colors, before gamma correction and without master brightness (the same values as the web live preview). On the Receiver, uncheck **Config → Sync Interfaces → Disable realtime gamma correction** (checked by default) and keep the color gamma setting equal to the Master's; otherwise the Receiver shows washed-out colors. `/json/state` reports `realtime-gamma: true` when the Receiver applies gamma.
 
 
 ## Receiver startup and communication-loss policy (v1.4.0)
@@ -211,6 +231,26 @@ Offset  Size  Field
 
 The CRC starts at the protocol-version byte and ends at the final payload byte. Magic and the CRC field itself are excluded. Parameters: polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR.
 
+### Segment table frame (`WPS1`)
+
+A running Master also sends WLED's active segment table on the same UART, whenever it changes and at least once per second. It uses the same header layout and CRC, with its own sequence counter (so it never opens gaps in the `WPB1` sequence). Receivers ignore it.
+
+```text
+Offset  Size  Field
+0       4     Magic: "WPS1"
+4       1     Protocol version: 1
+5       1     Flags; bit 0 = WLED on (global brightness > 0)
+6       4     Sequence number (independent of WPB1)
+10      2     Segment count S (active segments only; at most 32, or 64 with PSRAM)
+12      1     WLED brightness
+13      1     Reserved
+14      2     Payload length = 7*S
+16      7*S   Per segment: id (1), start (2), stop (2, exclusive), on (1), opacity (1)
+16+7*S  2     CRC-16/CCITT-FALSE
+```
+
+`id` is the index in WLED's segment list (the `id` in `/json/state`); `start`/`stop` are logical indices in the same space as the `WPB1` pixels.
+
 ## Diagnostics and bench testing
 
 The Receiver tracks transport quality without printing continuously to Serial, so diagnostics do not disturb timing. The counters are available on the WLED Info page and in `/json/state` under `UART Pixel Bridge`.
@@ -222,7 +262,9 @@ received                  valid frames whose CRC passed
 applied                   valid frames actually shown (one physical show per applied frame)
 dropped                   queued frames discarded locally to keep latency low
 crc-errors                complete frames rejected by CRC-16
-framing-errors            invalid protocol headers/lengths
+framing-errors            invalid protocol headers/lengths, or a frame without this Receiver's window
+stream-led-count          LEDs per frame (Master: sent; Receiver: last header seen)
+segments-sent             WPS1 segment table frames written by the Master
 sequence-gap-events       number of forward jumps in the 32-bit sequence
 missing-sequences         total sequence numbers absent between valid frames
 duplicate-sequences       repeated sequence numbers

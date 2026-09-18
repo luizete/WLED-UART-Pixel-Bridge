@@ -1,7 +1,8 @@
 [platformio]
-default_envs = esp32dev_V4
+default_envs = esp32dev
 
-[env:esp32dev_V4]
+; WLED 16: esp32dev already builds audioreactive; this list replaces it.
+[env:esp32dev]
 custom_usermods =
   audioreactive
   uart_pixel_bridge

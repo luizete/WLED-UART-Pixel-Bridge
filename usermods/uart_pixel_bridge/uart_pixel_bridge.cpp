@@ -60,18 +60,30 @@ class UartPixelBridge : public Usermod {
       uint32_t sequence = 0;
       uint16_t ledCount = 0;
       uint8_t brightness = 0;
+      bool reversed = false;
     };
 
     static constexpr uint8_t PROTOCOL_VERSION = 1;
     static constexpr uint8_t MAGIC[4] = {'W', 'P', 'B', '1'};
+    static constexpr uint8_t SEG_MAGIC[4] = {'W', 'P', 'S', '1'};
     static constexpr size_t MAGIC_SIZE = sizeof(MAGIC);
     static constexpr size_t HEADER_AFTER_MAGIC_SIZE = 12;
     static constexpr size_t HEADER_SIZE = MAGIC_SIZE + HEADER_AFTER_MAGIC_SIZE;
     static constexpr size_t CRC_SIZE = 2;
     static constexpr uint16_t MAX_LED_COUNT = 2048;
+    // Largest stream a Receiver accepts; it keeps only its own window of it.
+    static constexpr uint16_t MAX_STREAM_LEDS = 8192;
+    static constexpr size_t RX_DRIVER_BUFFER_BYTES = 24576;
     static constexpr uint8_t BUFFER_COUNT = 3;
     static constexpr uint32_t MIN_BAUD = 115200;
     static constexpr uint32_t MAX_BAUD = 5000000;
+
+    // WPS1 segment table: 7 bytes per active segment.
+    static constexpr size_t SEG_ENTRY_SIZE = 7;
+    // WLED 16: 32 segments, or 64 on boards with PSRAM.
+    static constexpr size_t SEG_MAX = MAX_NUM_SEGMENTS;
+    static constexpr size_t SEG_FRAME_MAX_SIZE = HEADER_SIZE + SEG_ENTRY_SIZE * SEG_MAX + CRC_SIZE;
+    static constexpr uint32_t SEG_REFRESH_MS = 1000;
 
     static const char _name[];
 
@@ -88,6 +100,7 @@ class UartPixelBridge : public Usermod {
     uint8_t _maxFps = 60;
     uint16_t _realtimeTimeoutMs = 500;
     bool _reverse = false;
+    bool _sendAll = false;
     bool _fastReceiver = false;
 
     // Receiver startup/failsafe policy. These settings only affect Receiver role.
@@ -137,10 +150,29 @@ class UartPixelBridge : public Usermod {
     volatile uint32_t _reacquireFramesSuppressed = 0;
     volatile uint32_t _failsafeShows = 0;
 
+    // Effective range for the running bridge. Equal to the settings, except on a
+    // send-all Master, where it covers the whole strip and reverse is off.
+    uint16_t _runSourceStart = 0;
+    uint16_t _runLedCount = 0;
+    bool _runReverse = false;
+    uint16_t _sendAllTotal = 0;
+
     // Master state.
     uint32_t _nextSequence = 0;
     uint32_t _lastCaptureUs = 0;
     uint32_t _frameIntervalUs = 16666;
+
+    // Master WPS1 state. _segScratch is touched only by the render task;
+    // _segFrame, _segFrameSize and _segPending only under _bufferMutex.
+    uint8_t _segScratch[SEG_FRAME_MAX_SIZE] = {0};
+    uint8_t _segFrame[SEG_FRAME_MAX_SIZE] = {0};
+    size_t _segFrameSize = 0;
+    bool _segPending = false;
+    uint32_t _segSequence = 0;
+    uint16_t _segLastContentCrc = 0;
+    uint32_t _segLastSentMs = 0;
+    bool _segForceSend = true;
+    volatile uint32_t _segFramesSent = 0;
 
     // Receiver parser state. Used only by the receiver task.
     RxState _rxState = RxState::FindMagic;
@@ -155,6 +187,11 @@ class UartPixelBridge : public Usermod {
     uint16_t _rxCrc = 0xFFFF;
     uint16_t _rxReceivedCrc = 0;
     int8_t _rxFillBuffer = -1;
+    bool _rxFrameReversed = false;
+    // Payload byte window [_rxWinStart, _rxWinEnd) copied into the fill buffer.
+    size_t _rxWinStart = 0;
+    size_t _rxWinEnd = 0;
+    volatile uint16_t _rxStreamLedCount = 0;
 
     // Runtime statistics.
     volatile uint32_t _framesCaptured = 0;
@@ -582,6 +619,9 @@ class UartPixelBridge : public Usermod {
       _rxCrc = 0xFFFF;
       _rxReceivedCrc = 0;
       _rxFillBuffer = -1;
+      _rxFrameReversed = false;
+      _rxWinStart = 0;
+      _rxWinEnd = 0;
     }
 
     bool allocateRolePin() {
@@ -619,7 +659,8 @@ class UartPixelBridge : public Usermod {
     }
 
     bool allocateBuffers() {
-      _payloadSize = static_cast<size_t>(_ledCount) * 3U;
+      // Receiver buffers hold only its own window, never the whole stream.
+      _payloadSize = static_cast<size_t>(_runLedCount) * 3U;
       _frameSize = HEADER_SIZE + _payloadSize + CRC_SIZE;
 
       const size_t allocationSize = (_role == Role::Master) ? _frameSize : _payloadSize;
@@ -661,8 +702,28 @@ class UartPixelBridge : public Usermod {
     bool startBridge() {
       _lastError = String();
       if (!_enabled) return false;
-      if (_ledCount == 0 || _ledCount > MAX_LED_COUNT) {
-        _lastError = F("Invalid LED count");
+
+      _runSourceStart = _sourceStart;
+      _runLedCount = _ledCount;
+      _runReverse = _reverse;
+      const bool sendAll = _role == Role::Master && _sendAll;
+      if (sendAll) {
+        // Reverse on the Master would flip the whole strip and move every
+        // Receiver's window; with send-all, reverse belongs to the Receivers.
+        _sendAllTotal = strip.getLengthTotal();
+        _runSourceStart = 0;
+        _runLedCount = _sendAllTotal;
+        _runReverse = false;
+      }
+
+      if (_runLedCount == 0 || _runLedCount > MAX_LED_COUNT) {
+        if (sendAll) _lastError = F("send-all: total LED count must be 1-2048");
+        else _lastError = F("Invalid LED count");
+        return false;
+      }
+      if (_role == Role::Receiver &&
+          static_cast<uint32_t>(_sourceStart) + _ledCount > MAX_STREAM_LEDS) {
+        _lastError = F("source-start + led-count exceeds 8192");
         return false;
       }
       if (_uartNumber < 1 || _uartNumber > 2) {
@@ -689,13 +750,12 @@ class UartPixelBridge : public Usermod {
       }
 
       if (_role == Role::Receiver) {
-        // Must be configured before begin(). Keep several complete UART frames
-        // in the driver ring so a long LED show cannot starve the UART receiver.
-        size_t desiredRxBuffer = _frameSize * 6U;
-        if (desiredRxBuffer < 8192U) desiredRxBuffer = 8192U;
-        if (desiredRxBuffer > 24576U) desiredRxBuffer = 24576U;
-        _rxDriverBufferBytes = desiredRxBuffer;
-        _uart->setRxBufferSize(desiredRxBuffer);
+        // Must be configured before begin(). The frame on the wire may carry the
+        // Master's whole strip, much larger than this Receiver's window, so size
+        // the driver ring for the largest stream (4 frames of 2048 LEDs) so a
+        // long LED show cannot starve the UART receiver.
+        _rxDriverBufferBytes = RX_DRIVER_BUFFER_BYTES;
+        _uart->setRxBufferSize(RX_DRIVER_BUFFER_BYTES);
         _uart->setTimeout(5);
         _uart->begin(_baud, SERIAL_8N1, _rxPin, -1);
       } else {
@@ -705,6 +765,9 @@ class UartPixelBridge : public Usermod {
       _frameIntervalUs = 1000000UL / (_maxFps == 0 ? 1U : _maxFps);
       _taskStop = false;
       resetParser(false);
+      _segPending = false;
+      _segFrameSize = 0;
+      _segForceSend = true;
       if (_role == Role::Receiver) _hasReceivedSequence = false;
       if (_statsStartedMs == 0U) _statsStartedMs = millis();
 
@@ -776,20 +839,20 @@ class UartPixelBridge : public Usermod {
     void buildMasterFrame(uint8_t* frame, uint32_t sequence) {
       memcpy(frame, MAGIC, MAGIC_SIZE);
       frame[4] = PROTOCOL_VERSION;
-      frame[5] = _reverse ? 0x01U : 0x00U;
+      frame[5] = _runReverse ? 0x01U : 0x00U;
       writeLe32(frame + 6, sequence);
-      writeLe16(frame + 10, _ledCount);
+      writeLe16(frame + 10, _runLedCount);
       frame[12] = bri;
       frame[13] = 0;
       writeLe16(frame + 14, static_cast<uint16_t>(_payloadSize));
 
       uint8_t* payload = frame + HEADER_SIZE;
       const uint16_t totalLength = strip.getLengthTotal();
-      for (uint16_t destination = 0; destination < _ledCount; destination++) {
-        const uint16_t logicalOffset = _reverse
-          ? static_cast<uint16_t>(_ledCount - 1U - destination)
+      for (uint16_t destination = 0; destination < _runLedCount; destination++) {
+        const uint16_t logicalOffset = _runReverse
+          ? static_cast<uint16_t>(_runLedCount - 1U - destination)
           : destination;
-        const uint32_t logicalIndex = static_cast<uint32_t>(_sourceStart) + logicalOffset;
+        const uint32_t logicalIndex = static_cast<uint32_t>(_runSourceStart) + logicalOffset;
         uint32_t color = 0;
         if (logicalIndex < totalLength) color = strip.getPixelColor(static_cast<uint16_t>(logicalIndex));
 
@@ -803,12 +866,69 @@ class UartPixelBridge : public Usermod {
       writeLe16(frame + HEADER_SIZE + _payloadSize, crc);
     }
 
+    // Builds the WPS1 segment table in the render task, where reading segments
+    // is safe, and hands it to the TX task, the only writer on the UART.
+    void buildSegmentsFrame() {
+      uint8_t* entry = _segScratch + HEADER_SIZE;
+      uint16_t count = 0;
+      const size_t segmentsNum = strip.getSegmentsNum();
+      for (size_t i = 0; i < segmentsNum && i <= 255U && count < SEG_MAX; i++) {
+        Segment& seg = strip.getSegment(static_cast<uint8_t>(i));
+        if (!seg.isActive()) continue;
+        // id = index in WLED's segment vector, matching the id in /json/state.
+        entry[0] = static_cast<uint8_t>(i);
+        writeLe16(entry + 1, seg.start);
+        writeLe16(entry + 3, seg.stop);
+        entry[5] = seg.on ? 0x01U : 0x00U;
+        entry[6] = seg.opacity;
+        entry += SEG_ENTRY_SIZE;
+        count++;
+      }
+
+      const uint16_t payloadLength = static_cast<uint16_t>(count * SEG_ENTRY_SIZE);
+      memcpy(_segScratch, SEG_MAGIC, MAGIC_SIZE);
+      _segScratch[4] = PROTOCOL_VERSION;
+      // WLED sets the global bri to 0 when turned off (the previous value is
+      // kept in briLast).
+      _segScratch[5] = bri > 0 ? 0x01U : 0x00U;
+      writeLe16(_segScratch + 10, count);
+      _segScratch[12] = bri;
+      _segScratch[13] = 0;
+      writeLe16(_segScratch + 14, payloadLength);
+
+      // Content CRC without the sequence, only to detect changes.
+      const uint16_t contentCrc = crc16(_segScratch + 10, 6U + payloadLength, crc16(_segScratch + 5, 1));
+      const uint32_t nowMs = millis();
+      if (!_segForceSend && contentCrc == _segLastContentCrc &&
+          static_cast<uint32_t>(nowMs - _segLastSentMs) < SEG_REFRESH_MS) return;
+
+      // Own sequence counter: sharing the WPB1 counter would open a gap in the
+      // Receiver's pixel sequence for every WPS1 frame.
+      writeLe32(_segScratch + 6, _segSequence);
+      const size_t length = HEADER_SIZE + payloadLength;
+      writeLe16(_segScratch + length, crc16(_segScratch + MAGIC_SIZE, length - MAGIC_SIZE));
+
+      if (!takeMutex(pdMS_TO_TICKS(2))) return; // retry on the next frame
+      memcpy(_segFrame, _segScratch, length + CRC_SIZE);
+      _segFrameSize = length + CRC_SIZE;
+      _segPending = true;
+      giveMutex();
+
+      _segSequence++;
+      _segLastContentCrc = contentCrc;
+      _segLastSentMs = nowMs;
+      _segForceSend = false;
+      if (_ioTaskHandle) xTaskNotifyGive(_ioTaskHandle);
+    }
+
     void captureMasterFrame() {
       if (!_running || _role != Role::Master || !_uart) return;
 
       const uint32_t nowUs = micros();
       if (static_cast<uint32_t>(nowUs - _lastCaptureUs) < _frameIntervalUs) return;
       _lastCaptureUs = nowUs;
+
+      buildSegmentsFrame();
 
       const int8_t bufferIndex = acquireFreeBuffer(true);
       if (bufferIndex < 0) {
@@ -821,13 +941,35 @@ class UartPixelBridge : public Usermod {
       queueBuffer(bufferIndex);
     }
 
+    void sendPendingSegmentsFrame() {
+      // Copy under the mutex so the render task can build the next table while
+      // this copy is being written.
+      uint8_t frame[SEG_FRAME_MAX_SIZE];
+      size_t size = 0;
+      if (!takeMutex(pdMS_TO_TICKS(5))) return;
+      if (_segPending) {
+        size = _segFrameSize;
+        memcpy(frame, _segFrame, size);
+        _segPending = false;
+      }
+      giveMutex();
+
+      if (!size || !_uart) return;
+      // The frame lives on this stack and the driver copies it, so no flush()
+      // is needed before returning.
+      if (_uart->write(frame, size) == size) _segFramesSent++;
+      else _uartWriteErrors++;
+    }
+
     void txTaskLoop() {
       while (!_taskStop) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
         if (_taskStop) break;
 
+        sendPendingSegmentsFrame();
         int8_t index;
         while ((index = takeQueuedBuffer()) >= 0) {
+          sendPendingSegmentsFrame();
           const size_t written = _uart ? _uart->write(_buffers[index], _frameSize) : 0;
           if (written == _frameSize) {
             // write() may return after buffering. flush() ensures the buffer is no
@@ -858,20 +1000,39 @@ class UartPixelBridge : public Usermod {
 
     bool parseHeader() {
       const uint8_t version = _rxHeader[0];
+      _rxFrameReversed = (_rxHeader[1] & 0x01U) != 0U;
       _rxSequence = readLe32(_rxHeader + 2);
       _rxLedCount = readLe16(_rxHeader + 6);
       _rxBrightness = _rxHeader[8];
       _rxPayloadLength = readLe16(_rxHeader + 10);
 
+      // The frame may be larger than this Receiver's range: only the window
+      // [source-start, source-start + led-count) is kept.
       if (version != PROTOCOL_VERSION ||
           _rxLedCount == 0 ||
-          _rxLedCount > _ledCount ||
-          _rxPayloadLength != static_cast<uint16_t>(_rxLedCount * 3U) ||
-          _rxPayloadLength > _payloadSize) {
+          _rxLedCount > MAX_STREAM_LEDS ||
+          _rxPayloadLength != static_cast<uint32_t>(_rxLedCount) * 3U) {
         _framingErrors++;
         _consecutiveValidFrames = 0;
         return false;
       }
+      _rxStreamLedCount = _rxLedCount;
+
+      // A frame that does not contain the whole window means a configuration
+      // mismatch; never apply half a window.
+      if (static_cast<uint32_t>(_sourceStart) + _ledCount > _rxLedCount) {
+        _framingErrors++;
+        _consecutiveValidFrames = 0;
+        return false;
+      }
+
+      // With the reverse flag, logical pixel j sits at wire position N - 1 - j,
+      // so the window starts at N - source-start - led-count and arrives reversed.
+      const uint16_t windowStartLed = _rxFrameReversed
+        ? static_cast<uint16_t>(_rxLedCount - _sourceStart - _ledCount)
+        : _sourceStart;
+      _rxWinStart = static_cast<size_t>(windowStartLed) * 3U;
+      _rxWinEnd = _rxWinStart + static_cast<size_t>(_ledCount) * 3U;
 
       _rxFillBuffer = acquireFreeBuffer(true);
       _rxPayloadPos = 0;
@@ -900,8 +1061,10 @@ class UartPixelBridge : public Usermod {
 
       trackReceivedSequence(_rxSequence);
       _rxMeta[_rxFillBuffer].sequence = _rxSequence;
-      _rxMeta[_rxFillBuffer].ledCount = _rxLedCount;
+      _rxMeta[_rxFillBuffer].ledCount = _ledCount;
       _rxMeta[_rxFillBuffer].brightness = _rxBrightness;
+      // Output reversed when exactly one of frame flag / Receiver reverse is on.
+      _rxMeta[_rxFillBuffer].reversed = _rxFrameReversed != _reverse;
       _framesReceived++;
       _lastValidFrameMs = millis();
       if (!_hasFirstValidFrameDelay) {
@@ -934,7 +1097,10 @@ class UartPixelBridge : public Usermod {
           break;
 
         case RxState::ReadPayload:
-          if (_rxFillBuffer >= 0) _buffers[_rxFillBuffer][_rxPayloadPos] = value;
+          // CRC covers every byte; only the window is stored.
+          if (_rxFillBuffer >= 0 && _rxPayloadPos >= _rxWinStart && _rxPayloadPos < _rxWinEnd) {
+            _buffers[_rxFillBuffer][_rxPayloadPos - _rxWinStart] = value;
+          }
           _rxPayloadPos++;
           _rxCrc = crc16Update(_rxCrc, value);
           if (_rxPayloadPos >= _rxPayloadLength) _rxState = RxState::ReadCrcLow;
@@ -1010,27 +1176,24 @@ class UartPixelBridge : public Usermod {
         }
 
         const uint16_t totalLength = strip.getLengthTotal();
+        const uint8_t* payload = _buffers[bufferIndex];
         for (uint16_t i = 0; i < meta.ledCount; i++) {
+          const uint16_t source = meta.reversed ? static_cast<uint16_t>(meta.ledCount - 1U - i) : i;
+          const size_t offset = static_cast<size_t>(source) * 3U;
+
+          // The failsafe copy is kept in output order.
+          if (_lastAppliedPayload) memcpy(_lastAppliedPayload + static_cast<size_t>(i) * 3U, payload + offset, 3U);
+
           const uint32_t target = static_cast<uint32_t>(_targetStart) + i;
-          if (target >= totalLength) break;
-          const size_t offset = static_cast<size_t>(i) * 3U;
-          const uint32_t color = RGBW32(
-            _buffers[bufferIndex][offset],
-            _buffers[bufferIndex][offset + 1U],
-            _buffers[bufferIndex][offset + 2U],
-            0
-          );
+          if (target >= totalLength) continue;
+          const uint32_t color = RGBW32(payload[offset], payload[offset + 1U], payload[offset + 2U], 0);
 
           // Keep WLED's realtime framebuffer authoritative. Writing directly to
           // BusManager bypasses WS2812FX state and can cause visible flicker when
           // any normal WLED show path repaints the bus from its framebuffer.
           strip.setRealtimePixelColor(static_cast<uint16_t>(target), color);
         }
-
-        if (_lastAppliedPayload) {
-          memcpy(_lastAppliedPayload, _buffers[bufferIndex], static_cast<size_t>(meta.ledCount) * 3U);
-          _lastAppliedLedCount = meta.ledCount;
-        }
+        if (_lastAppliedPayload) _lastAppliedLedCount = meta.ledCount;
 
         const uint32_t showStartedUs = micros();
         strip.show();
@@ -1084,6 +1247,12 @@ class UartPixelBridge : public Usermod {
     }
 
     void loop() override {
+      // Saving WLED's LED settings changes the strip length without calling this
+      // usermod's readFromConfig, so a send-all Master watches the total itself.
+      if (!_restartRequested && _enabled && _role == Role::Master && _sendAll &&
+          strip.getLengthTotal() != _sendAllTotal) {
+        _restartRequested = true;
+      }
       restartBridgeIfRequested();
       if (_statsResetRequested) resetStatistics();
       if (_role == Role::Receiver) {
@@ -1118,6 +1287,7 @@ class UartPixelBridge : public Usermod {
       top["max-fps"] = _maxFps;
       top["timeout-ms"] = _realtimeTimeoutMs;
       top["reverse"] = _reverse;
+      top["send-all"] = _sendAll;
       top["startup-guard"] = _startupGuardEnabled;
       top["startup-valid-frames"] = _startupValidFrames;
       top["failsafe"] = _failsafeEnabled;
@@ -1152,6 +1322,7 @@ class UartPixelBridge : public Usermod {
       complete &= getJsonValue(top["max-fps"], _maxFps, 60);
       complete &= getJsonValue(top["timeout-ms"], _realtimeTimeoutMs, 500);
       complete &= getJsonValue(top["reverse"], _reverse, false);
+      complete &= getJsonValue(top["send-all"], _sendAll, false);
       complete &= getJsonValue(top["startup-guard"], _startupGuardEnabled, true);
       complete &= getJsonValue(top["startup-valid-frames"], _startupValidFrames, 2);
       complete &= getJsonValue(top["failsafe"], _failsafeEnabled, true);
@@ -1179,10 +1350,11 @@ class UartPixelBridge : public Usermod {
       settingsScript.print(F("addOption(dd,'UART 2',2);"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:pin:0',1,'TX pin; used only by Master');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:pin:1',1,'RX pin; used only by Receiver');"));
-      settingsScript.print(F("addInfo('UART Pixel Bridge:source-start',1,'First logical LED copied by Master');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:source-start',1,'Master: first logical LED copied. Receiver: first LED of the received frame used here');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:target-start',1,'First physical LED written by Receiver');"));
-      settingsScript.print(F("addInfo('UART Pixel Bridge:led-count',1,'Must match on both controllers');"));
-      settingsScript.print(F("addInfo('UART Pixel Bridge:reverse',1,'Reverse the transmitted logical range on Master');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:led-count',1,'Master: LEDs sent (ignored with send-all). Receiver: LEDs taken from the frame');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:reverse',1,'Master: reverse the sent range (ignored with send-all). Receiver: reverse its own range');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:send-all',1,'Master only: send every LED of the strip plus the segment table');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:timeout-ms',1,'WLED realtime timeout; failsafe refreshes it while active');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:startup-guard',1,'Receiver only: keep controlled LEDs black until enough consecutive valid frames arrive');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:startup-valid-frames',1,'Receiver only: 1-20 consecutive valid frames required before first output');"));
@@ -1319,11 +1491,14 @@ class UartPixelBridge : public Usermod {
     void addToJsonState(JsonObject& root) override {
       JsonObject top = root[FPSTR(_name)];
       if (top.isNull()) top = root.createNestedObject(FPSTR(_name));
-      top["bridge-version"] = F("1.4.0");
+      top["bridge-version"] = F("1.5.0");
       top["running"] = _running;
       top["role"] = static_cast<uint8_t>(_role);
+      top["send-all"] = _sendAll;
+      top["stream-led-count"] = _role == Role::Master ? _runLedCount : _rxStreamLedCount;
       top["captured"] = _framesCaptured;
       top["sent"] = _framesSent;
+      top["segments-sent"] = _segFramesSent;
       top["received"] = _framesReceived;
       top["applied"] = _framesApplied;
       top["dropped"] = _framesDropped;
@@ -1348,6 +1523,9 @@ class UartPixelBridge : public Usermod {
       top["show-us-avg"] = averageShowMicros();
       top["show-us-max"] = _showMicrosMax;
       top["rx-driver-buffer-bytes"] = static_cast<uint32_t>(_rxDriverBufferBytes);
+      // Frames carry colors before gamma (WLED 16 framebuffer). A Receiver only
+      // matches the Master's own LEDs when this is true.
+      top["realtime-gamma"] = gammaCorrectCol && !arlsDisableGammaCorrection;
       top["receiver-state"] = receiverStateName();
       top["startup-guard-enabled"] = _startupGuardEnabled;
       top["startup-valid-frames"] = _startupValidFrames;
@@ -1374,6 +1552,7 @@ class UartPixelBridge : public Usermod {
 
 const char UartPixelBridge::_name[] PROGMEM = "UART Pixel Bridge";
 constexpr uint8_t UartPixelBridge::MAGIC[4];
+constexpr uint8_t UartPixelBridge::SEG_MAGIC[4];
 
 static UartPixelBridge uartPixelBridge;
 REGISTER_USERMOD(uartPixelBridge);

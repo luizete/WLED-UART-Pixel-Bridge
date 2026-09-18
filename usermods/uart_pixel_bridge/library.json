@@ -1,6 +1,6 @@
 {
   "name": "uart_pixel_bridge",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Low-latency RGB framebuffer bridge between two ESP32 WLED controllers over UART/RS-485, using a single-show WLED serial realtime receiver path, configurable startup guard/failsafe behavior, and CRC diagnostics.",
   "build": {
     "libArchive": false

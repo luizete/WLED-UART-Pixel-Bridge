@@ -1,8 +1,8 @@
 # Installation checklist
 
-1. Start from a current WLED `main` checkout compatible with the included usermod API.
+1. Start from a WLED 16.0.1 checkout.
 2. Copy `usermods/uart_pixel_bridge` into the WLED repository's `usermods` directory.
-3. For classic ESP32 + AudioReactive, use the included `platformio_override.ini.example`, which builds `esp32dev_V4` with both `audioreactive` and `uart_pixel_bridge`.
+3. For classic ESP32 + AudioReactive, use the included `platformio_override.ini.example`, which builds `esp32dev` with both `audioreactive` and `uart_pixel_bridge`.
 4. Build and flash the same binary to both ESP32 boards.
 5. Configure one board as Master and the other as Receiver under **Config → Usermods**.
 6. Usermod settings are applied with a live bridge restart when saved; a full ESP32 reboot is normally unnecessary.
