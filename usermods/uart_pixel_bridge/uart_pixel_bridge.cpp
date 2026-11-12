@@ -85,6 +85,20 @@ class UartPixelBridge : public Usermod {
     static constexpr size_t SEG_FRAME_MAX_SIZE = HEADER_SIZE + SEG_ENTRY_SIZE * SEG_MAX + CRC_SIZE;
     static constexpr uint32_t SEG_REFRESH_MS = 1000;
 
+    // Command port: newline-terminated text/JSON commands from an external
+    // controller (for example a Pi Pico reading ACC/lock signals).
+    static constexpr size_t CMD_LINE_MAX = 1024;
+    static constexpr size_t CMD_RX_BUFFER_BYTES = 2048;
+    static constexpr size_t CMD_BYTES_PER_LOOP = 512;
+    static constexpr uint32_t CMD_LINE_TIMEOUT_MS = 250;
+    static constexpr uint32_t CMD_MIN_BAUD = 1200;
+    static constexpr size_t CMD_LAST_SIZE = 40;
+#ifdef SOC_UART_NUM
+    static constexpr uint8_t UART_COUNT = SOC_UART_NUM;
+#else
+    static constexpr uint8_t UART_COUNT = 3;
+#endif
+
     static const char _name[];
 
     // Persistent settings.
@@ -112,6 +126,14 @@ class UartPixelBridge : public Usermod {
     uint32_t _failsafeFadeMs = 500;
     bool _reacquireGuardEnabled = true;
     uint8_t _reacquireValidFrames = 2;
+
+    // Command port settings. Independent of role and of the bridge's enabled flag.
+    bool _cmdEnabled = false;
+    uint8_t _cmdUartNumber = 2;
+    int8_t _cmdRxPin = -1;
+    int8_t _cmdTxPin = -1;
+    uint32_t _cmdBaud = 115200;
+    bool _cmdRequireChecksum = false;
 
     // Lifecycle.
     bool _initDone = false;
@@ -218,6 +240,26 @@ class UartPixelBridge : public Usermod {
     uint32_t _showMicrosMax = 0;
     size_t _rxDriverBufferBytes = 0;
 
+    // Command port runtime. Used only from WLED's main loop.
+    HardwareSerial* _cmdUart = nullptr;
+    bool _cmdRunning = false;
+    bool _cmdRestartRequested = false;
+    bool _cmdRxPinAllocated = false;
+    bool _cmdTxPinAllocated = false;
+    String _cmdLastError;
+    char* _cmdLine = nullptr;
+    size_t _cmdLineLength = 0;
+    bool _cmdDiscarding = false;
+    uint32_t _cmdLastByteMs = 0;
+    bool _cmdReplyChecksum = false;
+    bool _cmdReplySent = false;
+    char _cmdLastCommand[CMD_LAST_SIZE] = {0};
+    uint32_t _cmdLastCommandMs = 0;
+    uint32_t _cmdOk = 0;
+    uint32_t _cmdErrors = 0;
+    uint32_t _cmdChecksumErrors = 0;
+    uint32_t _cmdOverflows = 0;
+
     static uint16_t crc16Update(uint16_t crc, uint8_t data) {
       crc ^= static_cast<uint16_t>(data) << 8;
       for (uint8_t bit = 0; bit < 8; bit++) {
@@ -319,6 +361,10 @@ class UartPixelBridge : public Usermod {
       _startupFramesSuppressed = 0;
       _reacquireFramesSuppressed = 0;
       _failsafeShows = 0;
+      _cmdOk = 0;
+      _cmdErrors = 0;
+      _cmdChecksumErrors = 0;
+      _cmdOverflows = 0;
       _statsStartedMs = millis();
       _statsResetRequested = false;
     }
@@ -1216,6 +1262,305 @@ class UartPixelBridge : public Usermod {
       releaseBuffer(bufferIndex);
     }
 
+    bool startCommandPort() {
+      _cmdLastError = String();
+      if (!_cmdEnabled) return false;
+
+      if (_cmdUartNumber < 1 || _cmdUartNumber >= UART_COUNT) {
+        _cmdLastError = F("Command UART not available on this chip");
+        return false;
+      }
+      if (_enabled && _cmdUartNumber == _uartNumber) {
+        _cmdLastError = F("Command UART must differ from the bridge UART");
+        return false;
+      }
+      if (_cmdRxPin < 0) {
+        _cmdLastError = F("Command RX pin is disabled");
+        return false;
+      }
+      if (!PinManager::allocatePin(static_cast<byte>(_cmdRxPin), false, PinOwner::UM_Unspecified)) {
+        _cmdLastError = F("Command RX pin is already in use");
+        return false;
+      }
+      _cmdRxPinAllocated = true;
+      if (_cmdTxPin >= 0) {
+        if (!PinManager::allocatePin(static_cast<byte>(_cmdTxPin), true, PinOwner::UM_Unspecified)) {
+          _cmdLastError = F("Command TX pin is already in use");
+          stopCommandPort();
+          return false;
+        }
+        _cmdTxPinAllocated = true;
+      }
+
+      _cmdLine = new (std::nothrow) char[CMD_LINE_MAX + 1];
+      _cmdUart = new (std::nothrow) HardwareSerial(_cmdUartNumber);
+      if (!_cmdLine || !_cmdUart) {
+        _cmdLastError = F("Unable to allocate command port");
+        stopCommandPort();
+        return false;
+      }
+
+      // Must be configured before begin().
+      _cmdUart->setRxBufferSize(CMD_RX_BUFFER_BYTES);
+      _cmdUart->begin(_cmdBaud, SERIAL_8N1, _cmdRxPin, _cmdTxPin);
+      _cmdLineLength = 0;
+      _cmdDiscarding = false;
+      _cmdRunning = true;
+
+      // Lets the controller notice a reboot and resend the current scene.
+      _cmdReplyChecksum = _cmdRequireChecksum;
+      commandReply("READY");
+      return true;
+    }
+
+    void stopCommandPort() {
+      _cmdRunning = false;
+      if (_cmdUart) {
+        _cmdUart->end();
+        delete _cmdUart;
+        _cmdUart = nullptr;
+      }
+      if (_cmdRxPinAllocated) {
+        PinManager::deallocatePin(static_cast<byte>(_cmdRxPin), PinOwner::UM_Unspecified);
+        _cmdRxPinAllocated = false;
+      }
+      if (_cmdTxPinAllocated) {
+        PinManager::deallocatePin(static_cast<byte>(_cmdTxPin), PinOwner::UM_Unspecified);
+        _cmdTxPinAllocated = false;
+      }
+      delete[] _cmdLine;
+      _cmdLine = nullptr;
+      _cmdLineLength = 0;
+      _cmdDiscarding = false;
+    }
+
+    // Replies are newline-terminated and carry "*HH" when the request did.
+    void commandReply(const char* text) {
+      _cmdReplySent = true;
+      if (!_cmdUart || _cmdTxPin < 0) return;
+      if (_cmdReplyChecksum) {
+        uint8_t checksum = 0;
+        for (const char* p = text; *p; p++) checksum ^= static_cast<uint8_t>(*p);
+        _cmdUart->printf("%s*%02X\n", text, checksum);
+      } else {
+        _cmdUart->print(text);
+        _cmdUart->print('\n');
+      }
+    }
+
+    void commandError(const char* reason) {
+      _cmdErrors++;
+      char reply[64];
+      snprintf(reply, sizeof(reply), "ERR %s", reason);
+      commandReply(reply);
+    }
+
+    void replyCommandState() {
+      // Off keeps the previous brightness in briLast.
+      char reply[96];
+      snprintf(reply, sizeof(reply), "{\"on\":%s,\"bri\":%u,\"ps\":%d,\"pl\":%d,\"fx\":%u}",
+               bri ? "true" : "false",
+               static_cast<unsigned>(bri ? bri : briLast),
+               currentPreset ? static_cast<int>(currentPreset) : -1,
+               static_cast<int>(currentPlaylist),
+               static_cast<unsigned>(strip.getMainSegment().mode));
+      commandReply(reply);
+    }
+
+    static bool parseCommandNumber(const char* text, long minimum, long maximum, long& value) {
+      if (!text || !*text) return false;
+      char* end = nullptr;
+      value = strtol(text, &end, 10);
+      while (end && isspace(static_cast<unsigned char>(*end))) end++;
+      return end && !*end && value >= minimum && value <= maximum;
+    }
+
+    static bool parseCommandColor(const char* text, uint8_t& r, uint8_t& g, uint8_t& b) {
+      if (!text) return false;
+      if (*text == '#') text++;
+      if (strlen(text) != 6) return false;
+      for (uint8_t i = 0; i < 6; i++) {
+        if (!isxdigit(static_cast<unsigned char>(text[i]))) return false;
+      }
+      const uint32_t rgb = strtoul(text, nullptr, 16);
+      r = static_cast<uint8_t>(rgb >> 16);
+      g = static_cast<uint8_t>(rgb >> 8);
+      b = static_cast<uint8_t>(rgb);
+      return true;
+    }
+
+    // Full WLED JSON API, the same object accepted by POST /json/state.
+    const char* runJsonCommand(char* json, size_t length) {
+      if (!requestJSONBufferLock(JSON_LOCK_SERIAL)) return "busy";
+      const char* error = nullptr;
+      if (deserializeJson(*pDoc, json, length) || !pDoc->is<JsonObject>()) {
+        error = "json";
+      } else {
+        deserializeState(pDoc->as<JsonObject>(), CALL_MODE_DIRECT_CHANGE);
+      }
+      releaseJSONBufferLock();
+      return error;
+    }
+
+    const char* runTextCommand(char* line) {
+      char* argument = line;
+      while (*argument && !isspace(static_cast<unsigned char>(*argument))) argument++;
+      if (*argument) {
+        *argument++ = '\0';
+        while (isspace(static_cast<unsigned char>(*argument))) argument++;
+      }
+      auto is = [line](const char* name) { return strcasecmp(line, name) == 0; };
+      long value = 0;
+
+      if (is("PING")) {
+        commandReply("PONG");
+        return nullptr;
+      }
+      if (is("STATE")) {
+        replyCommandState();
+        return nullptr;
+      }
+      if (is("PS") || is("PL") || is("PRESET") || is("PLAYLIST")) {
+        if (!parseCommandNumber(argument, 1, 250, value)) return "preset must be 1-250";
+        // Unlike {"ps":n}, this restarts the preset or playlist even if it is current.
+        applyPreset(static_cast<byte>(value), CALL_MODE_DIRECT_CHANGE);
+        return nullptr;
+      }
+
+      // The remaining commands are translated to a JSON state object; "seg"
+      // without an id applies to all selected segments.
+      if (!requestJSONBufferLock(JSON_LOCK_SERIAL)) return "busy";
+      pDoc->clear();
+      JsonObject root = pDoc->to<JsonObject>();
+      const char* error = nullptr;
+      uint8_t r = 0, g = 0, b = 0;
+
+      if (is("ON")) {
+        root["on"] = true;
+      } else if (is("OFF")) {
+        root["on"] = false;
+      } else if (is("TOGGLE")) {
+        root["on"] = "t";
+      } else if (is("NEXT")) {
+        root["np"] = true;
+      } else if (is("BRI")) {
+        if (parseCommandNumber(argument, 0, 255, value)) root["bri"] = value;
+        else error = "bri must be 0-255";
+      } else if (is("FX")) {
+        if (parseCommandNumber(argument, 0, strip.getModeCount() - 1, value)) root.createNestedObject("seg")["fx"] = value;
+        else error = "unknown effect";
+      } else if (is("PAL")) {
+        if (parseCommandNumber(argument, 0, 255, value)) root.createNestedObject("seg")["pal"] = value;
+        else error = "pal must be 0-255";
+      } else if (is("SX")) {
+        if (parseCommandNumber(argument, 0, 255, value)) root.createNestedObject("seg")["sx"] = value;
+        else error = "sx must be 0-255";
+      } else if (is("IX")) {
+        if (parseCommandNumber(argument, 0, 255, value)) root.createNestedObject("seg")["ix"] = value;
+        else error = "ix must be 0-255";
+      } else if (is("COL")) {
+        if (parseCommandColor(argument, r, g, b)) {
+          JsonArray color = root.createNestedObject("seg").createNestedArray("col").createNestedArray();
+          color.add(r);
+          color.add(g);
+          color.add(b);
+        } else {
+          error = "col must be RRGGBB";
+        }
+      } else {
+        error = "unknown command";
+      }
+
+      if (!error) deserializeState(root, CALL_MODE_DIRECT_CHANGE);
+      releaseJSONBufferLock();
+      return error;
+    }
+
+    void handleCommandLine(char* line, size_t length) {
+      while (length && isspace(static_cast<unsigned char>(line[length - 1]))) line[--length] = '\0';
+      while (length && isspace(static_cast<unsigned char>(*line))) {
+        line++;
+        length--;
+      }
+      if (!length) return;
+
+      // Optional NMEA-style suffix: "*HH" = XOR of every byte before the '*'.
+      _cmdReplyChecksum = false;
+      _cmdReplySent = false;
+      if (length >= 3 && line[length - 3] == '*' &&
+          isxdigit(static_cast<unsigned char>(line[length - 2])) &&
+          isxdigit(static_cast<unsigned char>(line[length - 1]))) {
+        const uint8_t expected = static_cast<uint8_t>(strtoul(line + length - 2, nullptr, 16));
+        uint8_t actual = 0;
+        for (size_t i = 0; i < length - 3; i++) actual ^= static_cast<uint8_t>(line[i]);
+        _cmdReplyChecksum = true;
+        if (actual != expected) {
+          _cmdChecksumErrors++;
+          commandError("checksum");
+          return;
+        }
+        length -= 3;
+        line[length] = '\0';
+        while (length && isspace(static_cast<unsigned char>(line[length - 1]))) line[--length] = '\0';
+      } else if (_cmdRequireChecksum) {
+        _cmdChecksumErrors++;
+        commandError("checksum required");
+        return;
+      }
+
+      strlcpy(_cmdLastCommand, line, sizeof(_cmdLastCommand));
+      _cmdLastCommandMs = millis();
+
+      const char* error = line[0] == '{' ? runJsonCommand(line, length) : runTextCommand(line);
+      if (error) {
+        commandError(error);
+        return;
+      }
+      _cmdOk++;
+      if (!_cmdReplySent) commandReply("OK");
+    }
+
+    // Runs in WLED's main loop, where changing state and presets is safe.
+    void serviceCommandPort() {
+      if (!_cmdRunning || !_cmdUart || !_cmdLine) return;
+
+      const uint32_t nowMs = millis();
+      // Drop a partial line left by a controller reset or line noise.
+      if ((_cmdLineLength || _cmdDiscarding) &&
+          static_cast<uint32_t>(nowMs - _cmdLastByteMs) > CMD_LINE_TIMEOUT_MS) {
+        _cmdLineLength = 0;
+        _cmdDiscarding = false;
+      }
+
+      for (size_t budget = CMD_BYTES_PER_LOOP; budget > 0 && _cmdUart->available() > 0; budget--) {
+        const int value = _cmdUart->read();
+        if (value < 0) break;
+        _cmdLastByteMs = nowMs;
+        const char c = static_cast<char>(value);
+
+        if (c == '\n' || c == '\r') {
+          if (_cmdDiscarding) {
+            _cmdOverflows++;
+            _cmdReplyChecksum = _cmdRequireChecksum;
+            commandError("line too long");
+          } else if (_cmdLineLength) {
+            _cmdLine[_cmdLineLength] = '\0';
+            handleCommandLine(_cmdLine, _cmdLineLength);
+          }
+          _cmdLineLength = 0;
+          _cmdDiscarding = false;
+          continue;
+        }
+
+        if (_cmdDiscarding) continue;
+        if (_cmdLineLength >= CMD_LINE_MAX) {
+          _cmdDiscarding = true;
+          continue;
+        }
+        _cmdLine[_cmdLineLength++] = c;
+      }
+    }
+
     void validateSettings() {
       _fastReceiver = false; // direct BusManager output remains intentionally disabled
       if (_uartNumber < 1 || _uartNumber > 2) _uartNumber = 1;
@@ -1237,6 +1582,9 @@ class UartPixelBridge : public Usermod {
       if (failsafeValue > static_cast<uint8_t>(FailsafeAction::FadeToBlack)) {
         _failsafeAction = FailsafeAction::FadeToBlack;
       }
+      if (_cmdUartNumber < 1 || _cmdUartNumber > 2) _cmdUartNumber = 2;
+      if (_cmdBaud < CMD_MIN_BAUD) _cmdBaud = CMD_MIN_BAUD;
+      if (_cmdBaud > MAX_BAUD) _cmdBaud = MAX_BAUD;
     }
 
   public:
@@ -1244,6 +1592,7 @@ class UartPixelBridge : public Usermod {
       _initDone = true;
       validateSettings();
       _restartRequested = true;
+      _cmdRestartRequested = true;
     }
 
     void loop() override {
@@ -1254,7 +1603,14 @@ class UartPixelBridge : public Usermod {
         _restartRequested = true;
       }
       restartBridgeIfRequested();
+      if (_cmdRestartRequested) {
+        // After the bridge, so a pin clash is reported on the command port.
+        _cmdRestartRequested = false;
+        stopCommandPort();
+        startCommandPort();
+      }
       if (_statsResetRequested) resetStatistics();
+      serviceCommandPort();
       if (_role == Role::Receiver) {
         applyReceiverFrame();
         handleReceiverSafety();
@@ -1296,6 +1652,13 @@ class UartPixelBridge : public Usermod {
       top["failsafe-fade-ms"] = _failsafeFadeMs;
       top["reacquire-guard"] = _reacquireGuardEnabled;
       top["reacquire-valid-frames"] = _reacquireValidFrames;
+      top["cmd-enabled"] = _cmdEnabled;
+      top["cmd-uart"] = _cmdUartNumber;
+      JsonArray cmdPins = top.createNestedArray("cmd-pin");
+      cmdPins.add(_cmdRxPin);
+      cmdPins.add(_cmdTxPin);
+      top["cmd-baud"] = _cmdBaud;
+      top["cmd-checksum"] = _cmdRequireChecksum;
     }
 
     bool readFromConfig(JsonObject& root) override {
@@ -1303,7 +1666,10 @@ class UartPixelBridge : public Usermod {
       // are still intact. This prevents a show callback or UART task from using
       // newly loaded settings with buffers allocated for the previous settings.
       const bool reconfigureLive = _initDone;
-      if (reconfigureLive) stopBridge();
+      if (reconfigureLive) {
+        stopBridge();
+        stopCommandPort();
+      }
 
       JsonObject top = root[FPSTR(_name)];
       bool complete = !top.isNull();
@@ -1331,13 +1697,22 @@ class UartPixelBridge : public Usermod {
       complete &= getJsonValue(top["failsafe-fade-ms"], _failsafeFadeMs, 500UL);
       complete &= getJsonValue(top["reacquire-guard"], _reacquireGuardEnabled, true);
       complete &= getJsonValue(top["reacquire-valid-frames"], _reacquireValidFrames, 2);
+      complete &= getJsonValue(top["cmd-enabled"], _cmdEnabled, false);
+      complete &= getJsonValue(top["cmd-uart"], _cmdUartNumber, 2);
+      complete &= getJsonValue(top["cmd-pin"][0], _cmdRxPin, -1);
+      complete &= getJsonValue(top["cmd-pin"][1], _cmdTxPin, -1);
+      complete &= getJsonValue(top["cmd-baud"], _cmdBaud, 115200UL);
+      complete &= getJsonValue(top["cmd-checksum"], _cmdRequireChecksum, false);
 
       _role = roleValue == 1 ? Role::Receiver : Role::Master;
       _failsafeAction = failsafeActionValue <= 2
         ? static_cast<FailsafeAction>(failsafeActionValue)
         : FailsafeAction::FadeToBlack;
       validateSettings();
-      if (reconfigureLive) _restartRequested = true;
+      if (reconfigureLive) {
+        _restartRequested = true;
+        _cmdRestartRequested = true;
+      }
       return complete;
     }
 
@@ -1367,6 +1742,14 @@ class UartPixelBridge : public Usermod {
       settingsScript.print(F("addInfo('UART Pixel Bridge:failsafe-fade-ms',1,'Receiver only: fade duration, 0-10000 ms');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:reacquire-guard',1,'Receiver only: require stable frames again after a failsafe event');"));
       settingsScript.print(F("addInfo('UART Pixel Bridge:reacquire-valid-frames',1,'Receiver only: 1-20 consecutive valid frames required to resume');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:cmd-enabled',1,'Command input (presets, playlists, effects) from an external controller');"));
+      settingsScript.print(F("dd=addDropdown('UART Pixel Bridge','cmd-uart');"));
+      settingsScript.print(F("addOption(dd,'UART 1',1);"));
+      settingsScript.print(F("addOption(dd,'UART 2',2);"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:cmd-uart',1,'Must differ from the bridge UART');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:cmd-pin:0',1,'Command RX pin (from controller TX)');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:cmd-pin:1',1,'Command TX pin for OK/ERR replies; -1 = none');"));
+      settingsScript.print(F("addInfo('UART Pixel Bridge:cmd-checksum',1,'Reject lines without a valid *HH checksum');"));
     }
 
     void addToJsonInfo(JsonObject& root) override {
@@ -1483,6 +1866,24 @@ class UartPixelBridge : public Usermod {
         rxbuf.add(F(" bytes"));
       }
 
+      if (_cmdEnabled) {
+        JsonArray command = user.createNestedArray(F("UART command input"));
+        if (_cmdRunning) {
+          command.add(_cmdOk);
+          command.add(F(" ok"));
+        } else {
+          command.add(_cmdLastError.length() ? _cmdLastError : String(F("stopped")));
+        }
+
+        JsonArray commandErrors = user.createNestedArray(F("UART command errors"));
+        commandErrors.add(_cmdErrors);
+        commandErrors.add(F(" errors"));
+
+        JsonArray lastCommand = user.createNestedArray(F("UART last command"));
+        // String copies: this may be serialized from the web server task.
+        lastCommand.add(String(_cmdLastCommand[0] ? _cmdLastCommand : "-"));
+      }
+
       JsonArray age = user.createNestedArray(F("UART stats age"));
       age.add(_statsStartedMs ? static_cast<uint32_t>(millis() - _statsStartedMs) / 1000U : 0U);
       age.add(F(" s"));
@@ -1491,7 +1892,7 @@ class UartPixelBridge : public Usermod {
     void addToJsonState(JsonObject& root) override {
       JsonObject top = root[FPSTR(_name)];
       if (top.isNull()) top = root.createNestedObject(FPSTR(_name));
-      top["bridge-version"] = F("1.5.0");
+      top["bridge-version"] = F("1.6.0");
       top["running"] = _running;
       top["role"] = static_cast<uint8_t>(_role);
       top["send-all"] = _sendAll;
@@ -1542,6 +1943,14 @@ class UartPixelBridge : public Usermod {
       top["failsafe-shows"] = _failsafeShows;
       top["first-valid-frame-ms"] = _hasFirstValidFrameDelay ? _firstValidFrameDelayMs : 0U;
       top["last-frame-age-ms"] = _lastValidFrameMs ? static_cast<uint32_t>(millis() - _lastValidFrameMs) : 0U;
+      top["cmd-running"] = _cmdRunning;
+      top["cmd-error"] = _cmdLastError;
+      top["cmd-ok"] = _cmdOk;
+      top["cmd-errors"] = _cmdErrors;
+      top["cmd-checksum-errors"] = _cmdChecksumErrors;
+      top["cmd-overflows"] = _cmdOverflows;
+      top["cmd-last"] = String(_cmdLastCommand);
+      top["cmd-last-age-ms"] = _cmdLastCommandMs ? static_cast<uint32_t>(millis() - _cmdLastCommandMs) : 0U;
     }
 
     uint16_t getId() override {

@@ -1,7 +1,15 @@
 [platformio]
-default_envs = esp32dev
+default_envs = esp32s3_4M_qspi
 
-; WLED 16: esp32dev already builds audioreactive; this list replaces it.
+; ESP32-S3 Super Mini (4 MB flash, 2 MB PSRAM). For a Super Mini without
+; PSRAM use esp32s3_4M_none instead.
+; WLED 16: the env already builds audioreactive; this list replaces it.
+[env:esp32s3_4M_qspi]
+custom_usermods =
+  audioreactive
+  uart_pixel_bridge
+
+; Classic ESP32.
 [env:esp32dev]
 custom_usermods =
   audioreactive

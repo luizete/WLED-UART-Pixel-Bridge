@@ -91,6 +91,69 @@ Frame size is `18 + 3·N` bytes at 10 line bits per byte, so keep `max-fps ≤ b
 
 **Upgrade order:** update the Receivers first (with `source-start = 0` they behave as before against an old Master), then the Master, enabling `send-all` and disabling `reverse`, and set `source-start`/`reverse` on each Receiver. A v1.4.0 Receiver rejects every frame larger than its `led-count`.
 
+## Command input (v1.6.0)
+
+A second, independent UART accepts commands from an external controller, for example a Raspberry Pi Pico that reads ACC, lock/unlock and door signals and selects the matching preset or playlist. It works in both roles, but connect it to the **Master**: the Master renders everything and the Receiver mirrors its frames, so a command on the Receiver is hidden while bridge frames arrive.
+
+```text
+cmd-enabled   true
+cmd-uart      UART 2 (must differ from the bridge UART; ESP32/ESP32-S3 have UART 1 and 2)
+cmd-pin 0     RX pin  ← controller TX
+cmd-pin 1     TX pin  → controller RX (optional, -1 = no replies)
+cmd-baud      115200
+cmd-checksum  false (true = reject lines without *HH)
+```
+
+The command port restarts by itself when the settings are saved. 3.3 V controllers such as the Pico connect directly (TX→RX, RX→TX, common GND) over a short wire; use a transceiver pair for long runs, as for the bridge.
+
+### Format
+
+One command per line, terminated by `\n` (`\r\n` is accepted). A line starting with `{` is the WLED JSON API, the same object accepted by `POST /json/state`; anything else is a text command (case-insensitive).
+
+```text
+PING                 → PONG
+PS 5 / PL 5          apply preset or playlist 5 (1–250); restarts it even if it is already running
+ON / OFF / TOGGLE
+BRI 128              global brightness 0–255
+FX 9                 effect on the selected segments
+PAL 6 / SX 128 / IX 200
+COL FF8000           primary color of the selected segments
+NEXT                 next entry of the running playlist
+STATE                → {"on":true,"bri":128,"ps":5,"pl":5,"fx":9}
+{"ps":5}             any WLED JSON state, e.g.
+{"playlist":{"ps":[1,2,3],"dur":[50,50,50],"transition":7,"repeat":0,"end":4}}
+```
+
+Every line gets one reply on `cmd-pin 1`: `OK`, `PONG`, the `STATE` object, or `ERR <reason>` (`unknown command`, `json`, `busy`, `checksum`, `line too long`, a range message). After boot the usermod sends `READY`, so the controller can resend the current scene after an ESP32 reset.
+
+The simplest design is to keep the logic in WLED presets and have the controller only pick IDs, for example: preset 10 = unlock welcome playlist, 11 = lock goodbye, 12 = ACC on, 13 = off. Presets and playlists are edited in the WLED UI without touching the controller firmware.
+
+### Optional checksum
+
+Append `*HH`, the XOR of every byte before the `*` in two hex digits (NMEA style): `PS 10*22`. A line with a wrong checksum is rejected; with `cmd-checksum` enabled, a line without one is rejected too. Replies to a checksummed line carry their own checksum. Partial lines are dropped after 250 ms without data, and lines over 1024 bytes are rejected; sending a bare `\n` before each command clears any noise left on the line.
+
+### Pi Pico example (MicroPython)
+
+```python
+from machine import UART, Pin
+import time
+
+uart = UART(0, baudrate=115200, tx=Pin(0), rx=Pin(1), timeout=300)
+
+def send(cmd):
+    cs = 0
+    for c in cmd.encode():
+        cs ^= c
+    uart.write(b"\n%s*%02X\n" % (cmd.encode(), cs))
+    return uart.readline() or b""      # e.g. b"OK*04\n"; b"" on timeout
+
+while not send("PING").startswith(b"PONG"):   # wait until WLED is up
+    time.sleep(0.5)
+send("PS 10")                                  # unlock welcome
+```
+
+The usermod's Info page and `/json/state` report `cmd-running`, `cmd-error`, `cmd-ok`, `cmd-errors`, `cmd-checksum-errors`, `cmd-overflows`, `cmd-last` and `cmd-last-age-ms`; `reset-stats` also clears these counters.
+
 ## Suggested settings
 
 ### Master
