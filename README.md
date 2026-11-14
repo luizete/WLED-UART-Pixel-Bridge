@@ -154,6 +154,32 @@ send("PS 10")                                  # unlock welcome
 
 The usermod's Info page and `/json/state` report `cmd-running`, `cmd-error`, `cmd-ok`, `cmd-errors`, `cmd-checksum-errors`, `cmd-overflows`, `cmd-last` and `cmd-last-age-ms`; `reset-stats` also clears these counters.
 
+### Hardware test and known behavior (2026-11-14)
+
+Tested on hardware with WLED 16.0.1 on two ESP32-S3 SuperMini boards: the Master on the DRIVER board and the Receiver on the PASS board of the `pico_car_misc` project.
+The controller was a Pi Pico 2 W running `pico_car_misc` 0.2.1, connected over 3.3 V GPIO with a 1 kΩ resistor in series on the Pico side.
+
+- **Settings used.**
+  - Master: bridge `pin` = [7, -1]; `cmd-uart` 2, `cmd-pin` [8, 9] (RX 8, TX 9), 115200 baud, `cmd-checksum` true.
+  - Receiver: `role` 1, `pin` = [-1, 7].
+- **Bridge.** 7,829 frames in 3 minutes (43.5 frames/s) with zero CRC, framing, missing-sequence or duplicate errors.
+  When the Master stopped sending for 5 s, the Receiver went to `blackout` and recovered by itself. Every Master reboot counted one resync and one failsafe event.
+- **Commands.**
+  - Replies arrived 2–4 ms after each command.
+  - `READY` arrives about 0.9 s after power-up.
+  - 3 minutes of `PING` every 2 s produced no errors.
+  - `FOO` → `ERR unknown command`; JSON lines → `OK`.
+- **Known behavior worth handling in the controller:**
+  - **A partial line can remain in the command buffer at power-up.** If the controller sends a command immediately after `READY`, the leading `\n` of that command terminates the partial line. The usermod then replies `ERR checksum required` to it, and the controller sees that `ERR` just before the `OK` for its own command.
+    - Seen on every power-up of the Master.
+    - Fix on the controller side: wait more than 250 ms after `READY` before the first command, so the partial line is dropped by the timeout. `pico_car_misc` waits 300 ms.
+  - **`PS n` replies `OK` even when preset `n` does not exist** (tested with `PS 99`). The controller cannot detect a missing preset.
+  - **`POST /json/cfg` needs the whole usermod object.** `readFromConfig` sets every missing key to its default. A POST with only `cmd-pin` turned the command input off and moved the bridge back to pins 17/16.
+  - **Saving the settings restarts the command port**, even when only bridge settings change. The usermod then sends `READY` again.
+- **Possible improvements (not done):**
+  - reply `ERR` for a preset or playlist that does not exist;
+  - discard whatever is in the command buffer when the port starts.
+
 ## Suggested settings
 
 ### Master
